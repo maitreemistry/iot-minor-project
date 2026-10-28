@@ -1,409 +1,562 @@
-
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <DHT.h>
 #include <Wire.h>
+#include <DHT.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <math.h>
 #include <string.h>
 
-#include "secrets.h"  // NEW: Separate Wi-Fi credentials
+#include "secrets.h"
 
-// ==================================================
-// PIN DEFINITIONS
-// ==================================================
+// =====================================================
+// PIN CONFIGURATION
+// =====================================================
 
-#define DHTPIN 22
-#define DHTTYPE DHT22
-#define IRPIN 5
-#define LEDPIN 26
+#define DHT_PIN 22
+#define DHT_TYPE DHT22
 
-// ==================================================
-// RECEIVER MAC ADDRESS
-// ==================================================
+#define IR_PIN 5
+#define LED_PIN 26
 
-uint8_t receiverAddress[] = {
-  0x10, 0x06, 0x1C, 0xB6, 0x1D, 0xC4
-};
+#define MPU_SDA 21
+#define MPU_SCL 18
 
-// ==================================================
-// ALERT THRESHOLDS
-// ==================================================
-
-const float TEMP_HIGH = 40.0;
-const float HUMIDITY_LOW = 20.0;
-const float HUMIDITY_HIGH = 80.0;
-const float ACCEL_THRESHOLD = 8.0;
-
-// ==================================================
+// =====================================================
 // SENSOR OBJECTS
-// ==================================================
+// =====================================================
 
-DHT dht(DHTPIN, DHTTYPE);
+DHT dht(DHT_PIN, DHT_TYPE);
 Adafruit_MPU6050 mpu;
 
-bool mpuConnected = false;
+// =====================================================
+// RECEIVER MAC ADDRESS
+// =====================================================
 
-// ==================================================
-// DATA STRUCTURE
-// MUST MATCH RECEIVER EXACTLY
-// ==================================================
+uint8_t receiverAddress[] = {
+    0x10, 0x06, 0x1C, 0xB6, 0x1D, 0xC4
+};
+
+// =====================================================
+// THRESHOLDS
+// =====================================================
+
+const float TEMP_HIGH = 30.0;
+
+const float HUMIDITY_LOW = 20.0;
+const float HUMIDITY_HIGH = 80.0;
+
+const float ACCEL_X_THRESHOLD = 20.0;
+const float ACCEL_Y_THRESHOLD = 20.0;
+const float ACCEL_Z_THRESHOLD = 20.0;
+
+// =====================================================
+// PACKET COUNTERS
+// =====================================================
+
+// Counts packets accepted by esp_now_send()
+uint32_t packetsSent = 0;
+
+// Counts successful ESP-NOW delivery callbacks
+uint32_t packetsDelivered = 0;
+
+// Counts failed ESP-NOW delivery callbacks
+uint32_t packetsFailed = 0;
+
+// =====================================================
+// ORIGINAL PACKET STRUCTURE
+// KEEP THIS STRUCTURE UNCHANGED
+// =====================================================
 
 typedef struct struct_message {
-  float temperature;
-  float humidity;
+    float temperature;
+    float humidity;
 
-  int irValue;
+    int irValue;
 
-  float ax;
-  float ay;
-  float az;
-  float acceleration;
+    float ax;
+    float ay;
+    float az;
+    float acceleration;
 
-  bool temperatureConnected;
-  bool humidityConnected;
-  bool irSensorConnected;
-  bool accelerometerConnected;
+    bool temperatureConnected;
+    bool humidityConnected;
+    bool irSensorConnected;
+    bool accelerometerConnected;
 
-  bool temperatureAlert;
-  bool humidityAlert;
-  bool irOffAlert;
-  bool accelerationAlert;
+    bool temperatureAlert;
+    bool humidityAlert;
+    bool irOffAlert;
+    bool accelerationAlert;
 
-  bool alertActive;
+    bool alertActive;
 } struct_message;
 
 struct_message sensorData;
 
-const size_t EXPECTED_PACKET_LENGTH = sizeof(struct_message);
+// =====================================================
+// CALLBACK STATUS
+// =====================================================
 
-// ==================================================
-// ESP-NOW SEND CALLBACK
-// ESP32 ARDUINO CORE 3.x
-// ==================================================
+volatile bool callbackReceived = false;
+volatile bool lastDeliverySuccessful = false;
+
+// =====================================================
+// MPU6050 CONNECTION CHECK
+// =====================================================
+
+bool checkMPU6050Connection() {
+    Wire.beginTransmission(0x68);
+
+    if (Wire.endTransmission() == 0) {
+        return true;
+    }
+
+    Wire.beginTransmission(0x69);
+
+    return Wire.endTransmission() == 0;
+}
+
+// =====================================================
+// ESP-NOW SEND CALLBACK - ESP32 CORE 3.x
+// =====================================================
 
 void OnDataSent(
-  const wifi_tx_info_t* info,
-  esp_now_send_status_t status
+    const wifi_tx_info_t *info,
+    esp_now_send_status_t status
 ) {
-  Serial.print("ESP-NOW delivery status: ");
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        packetsDelivered++;
+        lastDeliverySuccessful = true;
+    } else {
+        packetsFailed++;
+        lastDeliverySuccessful = false;
+    }
 
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    Serial.println("SUCCESS");
-  } else {
-    Serial.println("FAIL");
-  }
+    callbackReceived = true;
 }
 
-// ==================================================
+// =====================================================
 // SETUP
-// ==================================================
+// =====================================================
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
+    Serial.begin(115200);
+    delay(1000);
 
-  Serial.println();
-  Serial.println("========== TRANSMITTER STARTING ==========");
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("       ESP32 SENSOR TRANSMITTER");
+    Serial.println("========================================");
 
-  pinMode(LEDPIN, OUTPUT);
-  digitalWrite(LEDPIN, LOW);
+    pinMode(IR_PIN, INPUT);
+    pinMode(LED_PIN, OUTPUT);
 
-  pinMode(IRPIN, INPUT_PULLUP);
+    digitalWrite(LED_PIN, LOW);
 
-  dht.begin();
+    // Initialize sensors
+    dht.begin();
 
-  // MPU6050: SDA = GPIO 21, SCL = GPIO 18
-  Wire.begin(21, 18);
-  mpuConnected = mpu.begin();
+    Wire.begin(MPU_SDA, MPU_SCL);
 
-  if (mpuConnected) {
-    mpu.setFilterBandwidth(MPU6050_BAND_94_HZ);
+    if (mpu.begin()) {
+        Serial.println("[INIT] MPU6050 initialized");
+    } else {
+        Serial.println("[WARN] MPU6050 not detected");
+    }
+
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-    Serial.println("MPU6050 connected successfully.");
-  } else {
-    Serial.println("WARNING: MPU6050 not detected.");
-  }
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
-  // NEW: Read credentials from secrets.h
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.print("[INFO] Packet structure size: ");
+    Serial.print(sizeof(sensorData));
+    Serial.println(" bytes");
 
-  Serial.print("Connecting to Wi-Fi");
-
-  unsigned long startTime = millis();
-
-  while (
-    WiFi.status() != WL_CONNECTED &&
-    millis() - startTime < 20000
-  ) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nWi-Fi connection failed!");
-
-    while (true) {
-      delay(1000);
+    if (sizeof(sensorData) != 40) {
+        Serial.println(
+            "[WARN] Structure size differs from 40 bytes"
+        );
     }
-  }
 
-  Serial.println("\nWi-Fi connected.");
+    // Initialize Wi-Fi
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print("Transmitter MAC: ");
-  Serial.println(WiFi.macAddress());
+    Serial.print("[INIT] Connecting to Wi-Fi");
 
-  Serial.print("Wi-Fi channel: ");
-  Serial.println(WiFi.channel());
+    unsigned long startTime = millis();
 
-  // Initialize ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW initialization failed!");
-
-    while (true) {
-      delay(1000);
+    while (
+        WiFi.status() != WL_CONNECTED &&
+        millis() - startTime < 15000
+    ) {
+        delay(500);
+        Serial.print(".");
     }
-  }
 
-  esp_now_register_send_cb(OnDataSent);
+    Serial.println();
 
-  // Register receiver as peer
-  esp_now_peer_info_t peerInfo = {};
-
-  memcpy(peerInfo.peer_addr, receiverAddress, 6);
-
-  // Use the current Wi-Fi channel
-  peerInfo.channel = 0;
-  peerInfo.ifidx = WIFI_IF_STA;
-  peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add receiver peer!");
-
-    while (true) {
-      delay(1000);
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("[OK] Wi-Fi connected");
+    } else {
+        Serial.println("[WARN] Wi-Fi connection timed out");
     }
-  }
 
-  Serial.println("ESP-NOW initialized successfully.");
-  Serial.println("MQ135 removed from this project.");
+    Serial.print("[INFO] Transmitter MAC: ");
+    Serial.println(WiFi.macAddress());
 
-  Serial.printf(
-    "Fixed ESP-NOW payload length: %u bytes\n",
-    (unsigned int)EXPECTED_PACKET_LENGTH
-  );
+    // Initialize ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[ERROR] ESP-NOW initialization failed");
+        return;
+    }
 
-  Serial.println("Transmitter ready.");
+    esp_now_register_send_cb(OnDataSent);
+
+    // Configure receiver
+    esp_now_peer_info_t peerInfo = {};
+
+    memcpy(
+        peerInfo.peer_addr,
+        receiverAddress,
+        6
+    );
+
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("[ERROR] Failed to add receiver");
+        return;
+    }
+
+    Serial.println("[OK] ESP-NOW initialized");
+    Serial.println("[OK] Receiver peer configured");
+
+    Serial.println("----------------------------------------");
+    Serial.println("System ready");
+    Serial.println("========================================");
 }
 
-// ==================================================
+// =====================================================
 // MAIN LOOP
-// ==================================================
+// =====================================================
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Wi-Fi disconnected. Reconnecting...");
-    WiFi.reconnect();
-    delay(1000);
-    return;
-  }
+    // -------------------------------------------------
+    // 1. READ TEMPERATURE AND HUMIDITY
+    // -------------------------------------------------
 
-  // 1. READ DHT22
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
 
-  sensorData.temperatureConnected = !isnan(t);
-  sensorData.humidityConnected = !isnan(h);
+    sensorData.temperatureConnected = !isnan(temperature);
+    sensorData.humidityConnected = !isnan(humidity);
 
-  if (sensorData.temperatureConnected) {
-    sensorData.temperature = t;
-  }
+    sensorData.temperature =
+        sensorData.temperatureConnected ? temperature : 0.0f;
 
-  if (sensorData.humidityConnected) {
-    sensorData.humidity = h;
-  }
+    sensorData.humidity =
+        sensorData.humidityConnected ? humidity : 0.0f;
 
-  // 2. READ IR SENSOR
-  sensorData.irValue = digitalRead(IRPIN);
-  sensorData.irSensorConnected = true;
+    // -------------------------------------------------
+    // 2. READ IR SENSOR
+    // -------------------------------------------------
 
-  // Assumption: HIGH = no object / IR off
-  //             LOW  = object detected
+    sensorData.irValue = digitalRead(IR_PIN);
 
-  // 3. READ MPU6050
-  sensorData.accelerometerConnected = mpuConnected;
+    // A digital GPIO input cannot reliably identify
+    // physical disconnection of the IR sensor.
+    sensorData.irSensorConnected = true;
 
-  float accelerationMagnitude = 0.0f;
+    // -------------------------------------------------
+    // 3. READ MPU6050
+    // -------------------------------------------------
 
-  if (mpuConnected) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    sensorData.accelerometerConnected =
+        checkMPU6050Connection();
 
-    sensorData.ax = a.acceleration.x;
-    sensorData.ay = a.acceleration.y;
-    sensorData.az = a.acceleration.z;
+    if (sensorData.accelerometerConnected) {
+        sensors_event_t a, g, temp;
 
-    accelerationMagnitude = sqrtf(
-      a.acceleration.x * a.acceleration.x +
-      a.acceleration.y * a.acceleration.y +
-      a.acceleration.z * a.acceleration.z
+        if (mpu.getEvent(&a, &g, &temp)) {
+            sensorData.ax = a.acceleration.x;
+            sensorData.ay = a.acceleration.y;
+            sensorData.az = a.acceleration.z;
+
+            // Monitoring only; not used for threshold checks.
+            sensorData.acceleration = sqrtf(
+                sensorData.ax * sensorData.ax +
+                sensorData.ay * sensorData.ay +
+                sensorData.az * sensorData.az
+            );
+        } else {
+            sensorData.accelerometerConnected = false;
+
+            sensorData.ax = 0.0f;
+            sensorData.ay = 0.0f;
+            sensorData.az = 0.0f;
+            sensorData.acceleration = 0.0f;
+        }
+    } else {
+        sensorData.ax = 0.0f;
+        sensorData.ay = 0.0f;
+        sensorData.az = 0.0f;
+        sensorData.acceleration = 0.0f;
+    }
+
+    // -------------------------------------------------
+    // 4. TEMPERATURE ALERT
+    // -------------------------------------------------
+
+    sensorData.temperatureAlert =
+        !sensorData.temperatureConnected ||
+        sensorData.temperature > TEMP_HIGH;
+
+    // -------------------------------------------------
+    // 5. HUMIDITY ALERT
+    // -------------------------------------------------
+
+    sensorData.humidityAlert =
+        !sensorData.humidityConnected ||
+        sensorData.humidity < HUMIDITY_LOW ||
+        sensorData.humidity > HUMIDITY_HIGH;
+
+    // -------------------------------------------------
+    // 6. IR ALERT
+    // -------------------------------------------------
+
+    sensorData.irOffAlert =
+        !sensorData.irSensorConnected ||
+        sensorData.irValue == HIGH;
+
+    // -------------------------------------------------
+    // 7. INDIVIDUAL AXIS ALERTS
+    // -------------------------------------------------
+
+    bool xAxisAlert =
+        fabsf(sensorData.ax) > ACCEL_X_THRESHOLD;
+
+    bool yAxisAlert =
+        fabsf(sensorData.ay) > ACCEL_Y_THRESHOLD;
+
+    bool zAxisAlert =
+        fabsf(sensorData.az) > ACCEL_Z_THRESHOLD;
+
+    sensorData.accelerationAlert =
+        !sensorData.accelerometerConnected ||
+        xAxisAlert ||
+        yAxisAlert ||
+        zAxisAlert;
+
+    // -------------------------------------------------
+    // 8. OVERALL ALERT
+    // -------------------------------------------------
+
+    sensorData.alertActive =
+        sensorData.temperatureAlert ||
+        sensorData.humidityAlert ||
+        sensorData.irOffAlert ||
+        sensorData.accelerationAlert;
+
+    // -------------------------------------------------
+    // 9. LED
+    // -------------------------------------------------
+
+    digitalWrite(
+        LED_PIN,
+        sensorData.alertActive ? HIGH : LOW
     );
 
-    sensorData.acceleration = accelerationMagnitude;
-  } else {
-    sensorData.ax = 0.0f;
-    sensorData.ay = 0.0f;
-    sensorData.az = 0.0f;
-    sensorData.acceleration = 0.0f;
-  }
+    // -------------------------------------------------
+    // 10. ORGANIZED SERIAL MONITOR OUTPUT
+    // -------------------------------------------------
 
-  // 4. CALCULATE ALERTS
-  sensorData.temperatureAlert =
-    sensorData.temperatureConnected &&
-    sensorData.temperature > TEMP_HIGH;
+    Serial.println();
+    Serial.println("========================================");
+    Serial.printf("        SENSOR REPORT | Uptime: %lu ms\n",
+                  (unsigned long)millis());
+    Serial.println("========================================");
 
-  sensorData.humidityAlert =
-    sensorData.humidityConnected &&
-    (
-      sensorData.humidity < HUMIDITY_LOW ||
-      sensorData.humidity > HUMIDITY_HIGH
-    );
+    // Temperature and humidity
+    Serial.println("[1] ENVIRONMENT");
 
-  sensorData.irOffAlert =
-    sensorData.irSensorConnected &&
-    sensorData.irValue == HIGH;
-
-  sensorData.accelerationAlert =
-    sensorData.accelerometerConnected &&
-    accelerationMagnitude > ACCEL_THRESHOLD;
-
-  sensorData.alertActive =
-    sensorData.temperatureAlert ||
-    sensorData.humidityAlert ||
-    sensorData.irOffAlert ||
-    sensorData.accelerationAlert;
-
-  // 5. CONTROL LED
-  digitalWrite(
-    LEDPIN,
-    sensorData.alertActive ? HIGH : LOW
-  );
-
-  // 6. PRINT SENSOR READINGS
-  Serial.println();
-  Serial.println("========== SENSOR READINGS ==========");
-
-  if (sensorData.temperatureConnected) {
     Serial.printf(
-      "Temperature: %.2f C\n",
-      sensorData.temperature
+        "Temperature : %s",
+        sensorData.temperatureConnected ? "" : "DISCONNECTED "
     );
-  } else {
-    Serial.println("Temperature: SENSOR ERROR");
-  }
 
-  if (sensorData.humidityConnected) {
+    if (sensorData.temperatureConnected) {
+        Serial.printf("%.2f C", sensorData.temperature);
+    }
+    Serial.println();
+
     Serial.printf(
-      "Humidity: %.2f %%\n",
-      sensorData.humidity
+        "Humidity    : %s",
+        sensorData.humidityConnected ? "" : "DISCONNECTED "
     );
-  } else {
-    Serial.println("Humidity: SENSOR ERROR");
-  }
 
-  Serial.printf(
-    "IR status: %s\n",
-    sensorData.irValue == LOW
-      ? "OBJECT DETECTED"
-      : "NO OBJECT / IR OFF"
-  );
+    if (sensorData.humidityConnected) {
+        Serial.printf("%.2f %%", sensorData.humidity);
+    }
+    Serial.println();
 
-  if (sensorData.accelerometerConnected) {
     Serial.printf(
-      "Acceleration X: %.3f m/s^2\n",
-      sensorData.ax
+        "Temp Alert  : %s\n",
+        sensorData.temperatureAlert ? "ACTIVE" : "NORMAL"
     );
+
     Serial.printf(
-      "Acceleration Y: %.3f m/s^2\n",
-      sensorData.ay
+        "Humidity Alert: %s\n",
+        sensorData.humidityAlert ? "ACTIVE" : "NORMAL"
     );
+
+    // IR sensor
+    Serial.println("----------------------------------------");
+    Serial.println("[2] IR SENSOR");
+
+    Serial.printf("Digital Value: %d\n", sensorData.irValue);
+
     Serial.printf(
-      "Acceleration Z: %.3f m/s^2\n",
-      sensorData.az
+        "IR Alert     : %s\n",
+        sensorData.irOffAlert ? "ACTIVE" : "NORMAL"
     );
+
+    // Accelerometer
+    Serial.println("----------------------------------------");
+    Serial.println("[3] MPU6050 ACCELERATION");
+
     Serial.printf(
-      "Acceleration magnitude: %.3f m/s^2\n",
-      sensorData.acceleration
+        "Sensor Status: %s\n",
+        sensorData.accelerometerConnected
+            ? "CONNECTED"
+            : "DISCONNECTED"
     );
-  } else {
-    Serial.println("MPU6050: NOT CONNECTED");
-  }
 
-  // 7. PRINT ALERT STATUS
-  Serial.println("------------ ALERT STATUS ------------");
-
-  Serial.printf(
-    "Temperature alert: %s\n",
-    sensorData.temperatureAlert ? "ACTIVE" : "NORMAL"
-  );
-  Serial.printf(
-    "Humidity alert: %s\n",
-    sensorData.humidityAlert ? "ACTIVE" : "NORMAL"
-  );
-  Serial.printf(
-    "IR off alert: %s\n",
-    sensorData.irOffAlert ? "ACTIVE" : "NORMAL"
-  );
-  Serial.printf(
-    "Acceleration alert: %s\n",
-    sensorData.accelerationAlert ? "ACTIVE" : "NORMAL"
-  );
-  Serial.printf(
-    "Overall alert: %s\n",
-    sensorData.alertActive ? "ACTIVE" : "NORMAL"
-  );
-  Serial.printf(
-    "LED status: %s\n",
-    sensorData.alertActive ? "ON" : "OFF"
-  );
-
-  // 8. VALIDATE AND SEND FIXED-LENGTH PAYLOAD
-  const size_t packetLength = sizeof(sensorData);
-
-  Serial.printf(
-    "Transmitted payload length: %u bytes (expected: %u bytes)\n",
-    (unsigned int)packetLength,
-    (unsigned int)EXPECTED_PACKET_LENGTH
-  );
-
-  if (packetLength != EXPECTED_PACKET_LENGTH) {
-    Serial.println(
-      "SECURITY ALERT: Local payload length mismatch. Packet NOT sent."
-    );
-  } else {
     Serial.printf(
-      "TEST: Sending %u bytes; expected %u bytes\n",
-      (unsigned int)packetLength,
-      (unsigned int)EXPECTED_PACKET_LENGTH
+        "X: %7.2f m/s^2 | Limit: %.2f | %s\n",
+        sensorData.ax,
+        ACCEL_X_THRESHOLD,
+        xAxisAlert ? "ALERT" : "NORMAL"
     );
+
+    Serial.printf(
+        "Y: %7.2f m/s^2 | Limit: %.2f | %s\n",
+        sensorData.ay,
+        ACCEL_Y_THRESHOLD,
+        yAxisAlert ? "ALERT" : "NORMAL"
+    );
+
+    Serial.printf(
+        "Z: %7.2f m/s^2 | Limit: %.2f | %s\n",
+        sensorData.az,
+        ACCEL_Z_THRESHOLD,
+        zAxisAlert ? "ALERT" : "NORMAL"
+    );
+
+    Serial.printf(
+        "Magnitude (monitoring): %.2f m/s^2\n",
+        sensorData.acceleration
+    );
+
+    Serial.printf(
+        "Acceleration Alert: %s\n",
+        sensorData.accelerationAlert ? "ACTIVE" : "NORMAL"
+    );
+
+    // Overall system status
+    Serial.println("----------------------------------------");
+    Serial.println("[4] SYSTEM STATUS");
+
+    Serial.printf(
+        "Overall Alert: %s\n",
+        sensorData.alertActive ? "!!! ACTIVE !!!" : "NORMAL"
+    );
+
+    Serial.printf(
+        "LED Status   : %s\n",
+        sensorData.alertActive ? "ON" : "OFF"
+    );
+
+    // -------------------------------------------------
+    // 11. TRANSMIT PACKET
+    // -------------------------------------------------
+
+    callbackReceived = false;
 
     esp_err_t result = esp_now_send(
-      receiverAddress,
-      (const uint8_t*)&sensorData,
-      packetLength
+        receiverAddress,
+        (uint8_t *)&sensorData,
+        sizeof(sensorData)
     );
 
     if (result == ESP_OK) {
-      Serial.println("Test packet submitted successfully.");
-    } else {
-      Serial.printf("Send error: %d\n", result);
-    }
-  }
+        packetsSent++;
 
-  Serial.println("======================================");
-  delay(2000);
+        Serial.println("----------------------------------------");
+        Serial.println("[5] ESP-NOW TRANSMISSION");
+        Serial.println("Send request accepted");
+
+        Serial.printf(
+            "Packet Size        : %u bytes\n",
+            (unsigned int)sizeof(sensorData)
+        );
+
+        Serial.printf(
+            "Packets Submitted  : %lu\n",
+            (unsigned long)packetsSent
+        );
+
+        // Wait briefly for the asynchronous callback.
+        // The callback updates delivery counters.
+        unsigned long callbackStart = millis();
+
+        while (
+            !callbackReceived &&
+            millis() - callbackStart < 200
+        ) {
+            delay(1);
+        }
+
+        if (callbackReceived) {
+            Serial.printf(
+                "Latest Delivery    : %s\n",
+                lastDeliverySuccessful ? "SUCCESS" : "FAILED"
+            );
+        } else {
+            Serial.println(
+                "Latest Delivery    : CALLBACK PENDING"
+            );
+        }
+    } else {
+        Serial.println("----------------------------------------");
+        Serial.println("[5] ESP-NOW TRANSMISSION");
+        Serial.printf("Send request error: %d\n", result);
+    }
+
+    Serial.println("----------------------------------------");
+    Serial.println("[6] PACKET STATISTICS");
+
+    Serial.printf(
+        "Submitted : %lu\n",
+        (unsigned long)packetsSent
+    );
+
+    Serial.printf(
+        "Delivered : %lu\n",
+        (unsigned long)packetsDelivered
+    );
+
+    Serial.printf(
+        "Failed    : %lu\n",
+        (unsigned long)packetsFailed
+    );
+
+    Serial.println("========================================");
+
+    delay(1000);
 }
+
+
