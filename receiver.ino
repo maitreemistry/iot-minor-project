@@ -6,6 +6,7 @@
 #include <ArduinoJson.h>
 
 #include "secrets.h"
+#include "emqx_ca.h"
 
 // =====================================================
 // MQTT CONFIGURATION
@@ -826,9 +827,10 @@ void setup() {
 
     connectWiFi();
 
-    // TLS is encrypted, but certificate verification is
-    // disabled. Use a trusted CA certificate in production.
-    espClient.setInsecure();
+    // Verify the broker certificate using EMQX's official CA certificate.
+    // Save emqx_ca.h beside this sketch and paste the downloaded PEM
+    // certificate into EMQX_CA_CERT (see the accompanying header template).
+    espClient.setCACert(EMQX_CA_CERT);
 
     client.setServer(mqtt_server, mqtt_port);
     client.setCallback(mqttCallback);
